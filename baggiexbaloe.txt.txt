@@ -1,0 +1,2224 @@
+
+-- Services
+local Players = game:GetService("Players")
+local RunService = game:GetService("RunService")
+local UserInputService = game:GetService("UserInputService")
+local TweenService = game:GetService("TweenService")
+local Stats = game:GetService("Stats")
+
+local player = Players.LocalPlayer
+local waypoints = {}
+local currentWaypoint = 1
+local moving = false
+local speed = 29
+local connection 
+
+-- Keybinds data
+local keybindsData = {
+    autoLeft = Enum.KeyCode.A,
+    autoRight = Enum.KeyCode.D,
+    stopMovement = Enum.KeyCode.S
+}
+
+-- Bat Target variables
+local batActive = false
+local moveSpeed = 50
+local engageRange = 20
+local lastEquipTick = 0
+local lastUseTick = 0
+
+-- Infinity jump variables
+local infinityJumpEnabled = false
+local jumpForce = 50
+local clampFallSpeed = 80
+
+-- Unwalk variables
+local unwalkEnabled = false
+local savedAnims = {}
+local watcher
+
+-- UI state variables
+local uiLocked = false
+local dragging = false
+local dragStart
+local startPos
+local dragElement = nil
+
+-- Keybind Editor Variables
+local keybindEditorFrame
+local isEditingKeybind = false
+local currentEditingAction = nil
+
+-- Toggle states for Galaxy Duel Rush
+local isAutoRightActive = false
+local isAutoLeftActive = false
+
+-- Load saved keybinds
+local function loadKeybinds()
+    local success, saved = pcall(function()
+        if _G.GalaxyKeybinds then
+            return _G.GalaxyKeybinds
+        end
+        return nil
+    end)
+    
+    if success and saved then
+        for key, value in pairs(saved) do
+            if keybindsData[key] and Enum.KeyCode[value] then
+                keybindsData[key] = Enum.KeyCode[value]
+            end
+        end
+    end
+end
+
+-- Save keybinds
+local function saveKeybinds()
+    local saveData = {}
+    for key, value in pairs(keybindsData) do
+        saveData[key] = tostring(value)
+    end
+    
+    pcall(function()
+        _G.GalaxyKeybinds = saveData
+    end)
+end
+
+-- ========== BAT TARGET FUNCTIONS ==========
+local function character()
+    return player.Character or player.CharacterAdded:Wait()
+end
+
+local function rootPart()
+    local char = character()
+    return char and char:FindFirstChild("HumanoidRootPart")
+end
+
+local function humanoid()
+    local char = character()
+    return char and char:FindFirstChildOfClass("Humanoid")
+end
+
+-- UNWALK functions
+local function isMovementAnim(anim)
+    return anim and anim:IsA("Animation") and (
+        anim.Name:lower():find("walk") or
+        anim.Name:lower():find("run") or
+        anim.Name:lower():find("jump") or
+        anim.Name:lower():find("swim") or
+        anim.Name:lower():find("fall") or
+        anim.Name:lower():find("climb") or
+        anim.Name:lower():find("idle") or
+        anim.Name:lower():find("land") or
+        anim.Name:lower():find("sit") or
+        anim.Name:lower():find("crouch")
+    )
+end
+
+local function stopMovementAnims(hum)
+    if not hum then return end
+    for _, t in ipairs(hum:GetPlayingAnimationTracks()) do
+        if t.Name:lower():find("walk") or
+           t.Name:lower():find("run") or
+           t.Name:lower():find("jump") or
+           t.Name:lower():find("swim") or
+           t.Name:lower():find("fall") or
+           t.Name:lower():find("climb") or
+           t.Name:lower():find("idle") or
+           t.Name:lower():find("land") or
+           t.Name:lower():find("sit") or
+           t.Name:lower():find("crouch") then
+            t:Stop()
+        end
+    end
+end
+
+local function saveAndClear(anim)
+    for _, v in ipairs(savedAnims) do
+        if v.instance == anim then return end
+    end
+    table.insert(savedAnims, {instance = anim, id = anim.AnimationId})
+    anim.AnimationId = ""
+end
+
+local function restoreAnims()
+    for _, v in ipairs(savedAnims) do
+        if v.instance then
+            v.instance.AnimationId = v.id
+        end
+    end
+end
+
+local function added(desc)
+    if unwalkEnabled and isMovementAnim(desc) then
+        saveAndClear(desc)
+    end
+end
+
+local function scan(character)
+    local animate = character and character:FindFirstChild("Animate")
+    if not animate then return end
+
+    local function clear(folder, name)
+        local anim = folder and folder:FindFirstChild(name)
+        if anim and anim:IsA("Animation") then
+            saveAndClear(anim)
+        end
+    end
+
+    clear(animate:FindFirstChild("walk"), "WalkAnim")
+    clear(animate:FindFirstChild("run"), "RunAnim")
+    clear(animate:FindFirstChild("jump"), "JumpAnim")
+    clear(animate:FindFirstChild("swim"), "Swim")
+    clear(animate:FindFirstChild("swimidle"), "SwimIdle")
+    clear(animate:FindFirstChild("fall"), "FallAnim")
+    clear(animate:FindFirstChild("climb"), "ClimbAnim")
+    clear(animate:FindFirstChild("idle"), "Animation1")
+    clear(animate:FindFirstChild("idle"), "Animation2")
+    clear(animate:FindFirstChild("sit"), "SitAnim")
+    clear(animate:FindFirstChild("toolnone"), "ToolNoneAnim")
+    clear(animate:FindFirstChild("toolsit"), "ToolSitAnim")
+
+    local hum = character:FindFirstChildOfClass("Humanoid")
+    if hum then stopMovementAnims(hum) end
+end
+
+local function enableUnwalk()
+    local char = player.Character
+    if not char then return end
+    unwalkEnabled = true
+    savedAnims = {}
+    task.spawn(function()
+        scan(char)
+        if watcher then watcher:Disconnect() end
+        watcher = char.DescendantAdded:Connect(added)
+    end)
+end
+
+local function disableUnwalk()
+    if watcher then watcher:Disconnect() watcher = nil end
+    restoreAnims()
+    savedAnims = {}
+    unwalkEnabled = false
+end
+
+local function nearestPlayer()
+    local hrp = rootPart()
+    if not hrp then return end
+
+    local closest, minDist = nil, math.huge
+    for _, plr in ipairs(Players:GetPlayers()) do
+        if plr ~= player and plr.Character then
+            local targetHRP = plr.Character:FindFirstChild("HumanoidRootPart")
+            local targetHum = plr.Character:FindFirstChildOfClass("Humanoid")
+            if targetHRP and targetHum and targetHum.Health > 0 then
+                local distance = (targetHRP.Position - hrp.Position).Magnitude
+                if distance < minDist then
+                    minDist = distance
+                    closest = targetHRP
+                end
+            end
+        end
+    end
+    return closest, minDist
+end
+
+local function equipBat()
+    local hum = humanoid()
+    if not hum then return end
+
+    local char = character()
+    local batTool = player.Backpack:FindFirstChild("Bat") or (char and char:FindFirstChild("Bat"))
+    if batTool then
+        hum:EquipTool(batTool)
+        return batTool
+    end
+end
+
+-- Auto-rotation
+local lookConnection
+local attachment
+local alignOrientation
+local lookDistance = 50
+
+local function lookAtTarget(enable)
+    local hrp = rootPart()
+    local hum = humanoid()
+    if not hrp or not hum then return end
+
+    local function closestTarget()
+        local nearest
+        local shortest = lookDistance
+        for _, plr in ipairs(Players:GetPlayers()) do
+            if plr ~= player and plr.Character and plr.Character:FindFirstChild("HumanoidRootPart") then
+                local distance = (hrp.Position - plr.Character.HumanoidRootPart.Position).Magnitude
+                if distance < shortest then
+                    shortest = distance
+                    nearest = plr.Character.HumanoidRootPart
+                end
+            end
+        end
+        return nearest
+    end
+
+    local function startLooking()
+        hum.AutoRotate = false
+        attachment = Instance.new("Attachment", hrp)
+        alignOrientation = Instance.new("AlignOrientation")
+        alignOrientation.Attachment0 = attachment
+        alignOrientation.Mode = Enum.OrientationAlignmentMode.OneAttachment
+        alignOrientation.MaxTorque = Vector3.new(math.huge, math.huge, math.huge)
+        alignOrientation.Responsiveness = 300
+        alignOrientation.RigidityEnabled = true
+        alignOrientation.Parent = hrp
+
+        lookConnection = RunService.RenderStepped:Connect(function()
+            local target = closestTarget()
+            if not target then return end
+            local lookPos = Vector3.new(target.Position.X, hrp.Position.Y, target.Position.Z)
+            alignOrientation.CFrame = CFrame.lookAt(hrp.Position, lookPos)
+        end)
+    end
+
+    local function stopLooking()
+        if lookConnection then lookConnection:Disconnect() lookConnection = nil end
+        if alignOrientation then alignOrientation:Destroy() alignOrientation = nil end
+        if attachment then attachment:Destroy() attachment = nil end
+        hum.AutoRotate = true
+    end
+
+    if enable then startLooking() else stopLooking() end
+end
+
+-- ========== MOVEMENT LOGIC ==========
+local function moveToWaypoint()
+    if connection then connection:Disconnect() end
+    connection = RunService.Stepped:Connect(function()
+        if not moving then return end
+        local character = player.Character
+        local rootPart = character and character:FindFirstChild("HumanoidRootPart")
+        if not rootPart or #waypoints == 0 then return end
+        
+        local targetPos = waypoints[currentWaypoint].position
+        local wpSpeed = waypoints[currentWaypoint].speed or speed
+        local distance = (rootPart.Position - targetPos).Magnitude
+        
+        if distance < 5 then
+            currentWaypoint = (currentWaypoint % #waypoints) + 1
+        else
+            local direction = (targetPos - rootPart.Position).Unit
+            rootPart.Velocity = Vector3.new(direction.X * wpSpeed, rootPart.Velocity.Y, direction.Z * wpSpeed)
+        end
+    end)
+end
+
+local function stopMoving()
+    if connection then connection:Disconnect() connection = nil end
+    moving = false
+    local rootPart = player.Character and player.Character:FindFirstChild("HumanoidRootPart")
+    if rootPart then rootPart.Velocity = Vector3.new(0, rootPart.Velocity.Y, 0) end
+end
+
+-- ========== UI SETUP ==========
+local screenGui = Instance.new("ScreenGui")
+screenGui.Name = "GalaxyDuelRush"
+screenGui.Parent = player:WaitForChild("PlayerGui")
+screenGui.ResetOnSpawn = false
+screenGui.ZIndexBehavior = Enum.ZIndexBehavior.Sibling
+
+-- Lock button
+local lockButton = Instance.new("TextButton")
+lockButton.Name = "LockButton"
+lockButton.Size = UDim2.new(0, 35, 0, 35)
+lockButton.Position = UDim2.new(1, -45, 0, 10)
+lockButton.Text = "🔓"
+lockButton.Font = Enum.Font.GothamBold
+lockButton.TextSize = 16
+lockButton. BackgroundColor3 = Color3.fromRGB(0, 0, 0)
+lockButton.TextColor3 = Color3.new(1, 1, 1)
+lockButton.BorderSizePixel = 0
+lockButton.ZIndex = 20
+lockButton.AutoButtonColor = true
+lockButton.Parent = screenGui
+Instance.new("UICorner", lockButton).CornerRadius = UDim.new(0, 8)
+
+-- Floating Toggle button
+local toggleUIButton = Instance.new("TextButton")
+toggleUIButton.Text = "🌌"
+toggleUIButton.Size = UDim2.new(0, 45, 0, 45)
+toggleUIButton.Position = UDim2.new(1, -55, 0.5, -22)
+toggleUIButton. BackgroundColor3 = Color3.fromRGB(0, 0, 0)
+toggleUIButton.BackgroundTransparency = 0.2
+toggleUIButton.TextColor3 = Color3.fromRGB(255, 255, 255)
+toggleUIButton.Font = Enum.Font.GothamBold
+toggleUIButton.TextSize = 22
+toggleUIButton.ZIndex = 999
+toggleUIButton.Parent = screenGui
+Instance.new("UICorner", toggleUIButton).CornerRadius = UDim.new(1, 0)
+
+-- Main Frame
+local mainFrame = Instance.new("Frame")
+mainFrame.Size = UDim2.new(0, 230, 0, 250)
+mainFrame.Position = UDim2.new(0.5, -115, 0.5, -125)
+mainFrame.BackgroundColor3 = Color3.fromRGB(0, 0, 0)
+mainFrame.BackgroundTransparency = 0.25
+mainFrame.Visible = false
+mainFrame.ClipsDescendants = true
+mainFrame.ZIndex = 10
+mainFrame.Parent = screenGui
+Instance.new("UICorner", mainFrame).CornerRadius = UDim.new(0, 12)
+
+local stroke = Instance.new("UIStroke")
+stroke.Thickness = 2
+stroke.Color = Color3.fromRGB(255, 255, 255)
+stroke.ApplyStrokeMode = Enum.ApplyStrokeMode.Border
+stroke.Parent = mainFrame
+
+-- Moving Nebula Background
+local gradient = Instance.new("UIGradient")
+gradient.Color = ColorSequence.new({
+    ColorSequenceKeypoint.new(0, Color3.fromRGB(0,0,0)),
+    ColorSequenceKeypoint.new(1, Color3.fromRGB(30,30,30))
+})
+gradient.Parent = mainFrame
+
+task.spawn(function()
+    local rot = 0
+    while task.wait() do rot = (rot + 1) % 360 gradient.Rotation = rot end
+end)
+
+local title = Instance.new("TextLabel")
+title.Text = "Baggie X Baloe Duels"
+title.Size = UDim2.new(1, 0, 0, 30)
+title.BackgroundTransparency = 1
+title.TextColor3 = Color3.fromRGB(200, 220, 255)
+title.Font = Enum.Font.GothamBold
+title.TextSize = 12
+title.ZIndex = 11
+title.Parent = mainFrame
+
+local statusLabel = Instance.new("TextLabel")
+statusLabel.Text = "✨ READY"
+statusLabel.Size = UDim2.new(1, 0, 0, 15)
+statusLabel.Position = UDim2.new(0, 0, 0, 30)
+statusLabel.BackgroundTransparency = 1
+statusLabel.TextColor3 = Color3.fromRGB(100, 255, 150)
+statusLabel.Font = Enum.Font.GothamMedium
+statusLabel.TextSize = 11
+statusLabel.ZIndex = 11
+statusLabel.Parent = mainFrame
+
+-- Keybind Status
+local keybindLabel = Instance.new("TextLabel")
+keybindLabel.Text = "Keybinds: A=Left D=Right S=Stop"
+keybindLabel.Size = UDim2.new(1, 0, 0, 15)
+keybindLabel.Position = UDim2.new(0, 0, 0, 45)
+keybindLabel.BackgroundTransparency = 1
+keybindLabel.TextColor3 = Color3.fromRGB(150, 200, 255)
+keybindLabel.Font = Enum.Font.GothamMedium
+keybindLabel.TextSize = 10
+keybindLabel.ZIndex = 11
+keybindLabel.Parent = mainFrame
+
+-- Stats (FPS / Ping)
+local statsLabel = Instance.new("TextLabel")
+statsLabel.Size = UDim2.new(1, 0, 0, 15)
+statsLabel.Position = UDim2.new(0, 0, 1, -18)
+statsLabel.BackgroundTransparency = 1
+statsLabel.TextColor3 = Color3.fromRGB(180, 180, 200)
+statsLabel.Font = Enum.Font.Code
+statsLabel.TextSize = 9
+statsLabel.ZIndex = 11
+statsLabel.Parent = mainFrame
+
+-- Bat Target button
+local batTargetButton = Instance.new("TextButton")
+batTargetButton.Name = "BatTargetButton"
+batTargetButton.Size = UDim2.new(0, 120, 0, 35)
+batTargetButton.Position = UDim2.new(1, -130, 0, 55)
+batTargetButton.Text = "BAT TARGET: OFF"
+batTargetButton.Font = Enum.Font.GothamBold
+batTargetButton.TextSize = 10
+batTargetButton. BackgroundColor3 = Color3.fromRGB(0, 0, 0)
+batTargetButton.TextColor3 = Color3.new(1, 1, 1)
+batTargetButton.BorderSizePixel = 0
+batTargetButton.ZIndex = 10
+batTargetButton.Parent = screenGui
+
+-- Infinity Jump button
+local jumpButton = Instance.new("TextButton")
+jumpButton.Name = "JumpButton"
+jumpButton.Size = UDim2.new(0, 120, 0, 35)
+jumpButton.Position = UDim2.new(1, -130, 0, 100)
+jumpButton.Text = "INF JUMP: OFF"
+jumpButton.Font = Enum.Font.GothamBold
+jumpButton.TextSize = 10
+jumpButton. BackgroundColor3 = Color3.fromRGB(0, 0, 0)
+jumpButton.TextColor3 = Color3.new(1, 1, 1)
+jumpButton.BorderSizePixel = 0
+jumpButton.ZIndex = 10
+jumpButton.Parent = screenGui
+
+-- Unwalk button
+local unwalkButton = Instance.new("TextButton")
+unwalkButton.Name = "UnwalkButton"
+unwalkButton.Size = UDim2.new(0, 120, 0, 35)
+unwalkButton.Position = UDim2.new(1, -130, 0, 145)
+unwalkButton.Text = "UNWALK: OFF"
+unwalkButton.Font = Enum.Font.GothamBold
+unwalkButton.TextSize = 10
+unwalkButton. BackgroundColor3 = Color3.fromRGB(0, 0, 0)
+unwalkButton.TextColor3 = Color3.new(1, 1, 1)
+unwalkButton.BorderSizePixel = 0
+unwalkButton.ZIndex = 10
+unwalkButton.Parent = screenGui
+
+-- Style all purple buttons
+local function styleButton(button)
+    Instance.new("UICorner", button).CornerRadius = UDim.new(0, 8)
+    local stroke = Instance.new("UIStroke", button)
+   stroke.Color = Color3.fromRGB(255, 255, 255)
+    stroke.Thickness = 1.5
+    stroke.Transparency = 0.5
+    return stroke
+end
+
+-- Apply styles
+styleButton(batTargetButton)
+styleButton(jumpButton)
+styleButton(unwalkButton)
+styleButton(lockButton)
+
+-- Update keybind display
+local function updateKeybindDisplay()
+    keybindLabel.Text = string.format("Keybinds: %s=Left %s=Right %s=Stop", 
+        keybindsData.autoLeft.Name, keybindsData.autoRight.Name, keybindsData.stopMovement.Name)
+end
+
+-- ========== KEYBIND EDITOR ==========
+local function createKeybindEditorUI()
+    local overlayGui = Instance.new("ScreenGui")
+    overlayGui.Name = "GalaxyKeybindOverlay"
+    overlayGui.Parent = player:WaitForChild("PlayerGui")
+    overlayGui.ResetOnSpawn = false
+    overlayGui.ZIndexBehavior = Enum.ZIndexBehavior.Sibling
+    overlayGui.DisplayOrder = 999
+    
+    keybindEditorFrame = Instance.new("Frame")
+    keybindEditorFrame.Name = "KeybindEditorCompact"
+    keybindEditorFrame.Size = UDim2.new(0, 220, 0, 180)
+    keybindEditorFrame.Position = UDim2.new(0.5, -110, 0.3, -90)
+    keybindEditorFrame. BackgroundColor3 = Color3.fromRGB(0, 0, 0)
+    keybindEditorFrame.BackgroundTransparency = 0.05
+    keybindEditorFrame.Visible = false
+    keybindEditorFrame.ZIndex = 1000
+    keybindEditorFrame.Parent = overlayGui
+    
+    local editorCorner = Instance.new("UICorner")
+    editorCorner.CornerRadius = UDim.new(0, 10)
+    editorCorner.Parent = keybindEditorFrame
+    
+    local editorStroke = Instance.new("UIStroke")
+    editorStroke.Thickness = 2
+    editorStroke.Color = Color3.fromRGB(255, 100, 255)
+    editorStroke.ApplyStrokeMode = Enum.ApplyStrokeMode.Border
+    editorStroke.Parent = keybindEditorFrame
+    
+    -- Editor Title
+    local editorTitle = Instance.new("TextLabel")
+    editorTitle.Text = "✏️ EDIT KEYBINDS"
+    editorTitle.Size = UDim2.new(1, 0, 0, 20)
+    editorTitle.Position = UDim2.new(0, 0, 0, 5)
+    editorTitle.BackgroundTransparency = 1
+    editorTitle.TextColor3 = Color3.fromRGB(255, 200, 100)
+    editorTitle.Font = Enum.Font.GothamBold
+    editorTitle.TextSize = 12
+    editorTitle.ZIndex = 1001
+    editorTitle.Parent = keybindEditorFrame
+    
+    -- Instruction text
+    local instructionText = Instance.new("TextLabel")
+    instructionText.Name = "InstructionText"
+    instructionText.Text = "Tap button to change"
+    instructionText.Size = UDim2.new(1, 0, 0, 18)
+    instructionText.Position = UDim2.new(0, 0, 0, 25)
+    instructionText.BackgroundTransparency = 1
+    instructionText.TextColor3 = Color3.fromRGB(150, 250, 150)
+    instructionText.Font = Enum.Font.GothamMedium
+    instructionText.TextSize = 10
+    instructionText.ZIndex = 1001
+    instructionText.Parent = keybindEditorFrame
+    
+    -- Keybind buttons container
+    local keybindContainer = Instance.new("Frame")
+    keybindContainer.Name = "KeybindContainer"
+    keybindContainer.Size = UDim2.new(0.9, 0, 0, 90)
+    keybindContainer.Position = UDim2.new(0.05, 0, 0, 45)
+    keybindContainer.BackgroundTransparency = 1
+    keybindContainer.ZIndex = 1001
+    keybindContainer.Parent = keybindEditorFrame
+    
+    local keybindList = Instance.new("UIListLayout")
+    keybindList.Padding = UDim.new(0, 6)
+    keybindList.Parent = keybindContainer
+    
+    -- Create keybind buttons
+    local autoLeftKeybindBtn = Instance.new("TextButton")
+    autoLeftKeybindBtn.Name = "AutoLeftKeybindBtn"
+    autoLeftKeybindBtn.Text = "LEFT: " .. keybindsData.autoLeft.Name
+    autoLeftKeybindBtn.Size = UDim2.new(1, 0, 0, 25)
+    autoLeftKeybindBtn. BackgroundColor3 = Color3.fromRGB(0, 0, 0)
+    autoLeftKeybindBtn.TextColor3 = Color3.new(1, 1, 1)
+    autoLeftKeybindBtn.Font = Enum.Font.GothamBold
+    autoLeftKeybindBtn.TextSize = 10
+    autoLeftKeybindBtn.ZIndex = 1002
+    autoLeftKeybindBtn.Parent = keybindContainer
+    
+    Instance.new("UICorner", autoLeftKeybindBtn).CornerRadius = UDim.new(0, 5)
+    local stroke1 = Instance.new("UIStroke")
+    stroke1.Thickness = 1
+    stroke1.Color = Color3.fromRGB(150, 100, 255)
+    stroke1.Parent = autoLeftKeybindBtn
+    
+    local autoRightKeybindBtn = Instance.new("TextButton")
+    autoRightKeybindBtn.Name = "AutoRightKeybindBtn"
+    autoRightKeybindBtn.Text = "RIGHT: " .. keybindsData.autoRight.Name
+    autoRightKeybindBtn.Size = UDim2.new(1, 0, 0, 25)
+    autoRightKeybindBtn. BackgroundColor3 = Color3.fromRGB(0, 0, 0)
+    autoRightKeybindBtn.TextColor3 = Color3.new(1, 1, 1)
+    autoRightKeybindBtn.Font = Enum.Font.GothamBold
+    autoRightKeybindBtn.TextSize = 10
+    autoRightKeybindBtn.ZIndex = 1002
+    autoRightKeybindBtn.Parent = keybindContainer
+    
+    Instance.new("UICorner", autoRightKeybindBtn).CornerRadius = UDim.new(0, 5)
+    local stroke2 = Instance.new("UIStroke")
+    stroke2.Thickness = 1
+    stroke2.Color = Color3.fromRGB(150, 100, 255)
+    stroke2.Parent = autoRightKeybindBtn
+    
+    local stopKeybindBtn = Instance.new("TextButton")
+    stopKeybindBtn.Name = "StopKeybindBtn"
+    stopKeybindBtn.Text = "STOP: " .. keybindsData.stopMovement.Name
+    stopKeybindBtn.Size = UDim2.new(1, 0, 0, 25)
+    stopKeybindBtn.BackgroundColor3 = Color3.fromRGB(60, 40, 100)
+    stopKeybindBtn.TextColor3 = Color3.new(1, 1, 1)
+    stopKeybindBtn.Font = Enum.Font.GothamBold
+    stopKeybindBtn.TextSize = 10
+    stopKeybindBtn.ZIndex = 1002
+    stopKeybindBtn.Parent = keybindContainer
+    
+    Instance.new("UICorner", stopKeybindBtn).CornerRadius = UDim.new(0, 5)
+    local stroke3 = Instance.new("UIStroke")
+    stroke3.Thickness = 1
+    stroke3.Color = Color3.fromRGB(150, 100, 255)
+    stroke3.Parent = stopKeybindBtn
+    
+    -- Button click handlers
+    autoLeftKeybindBtn.Activated:Connect(function()
+        if not isEditingKeybind then
+            isEditingKeybind = true
+            currentEditingAction = "autoLeft"
+            autoLeftKeybindBtn.Text = "PRESS KEY FOR LEFT"
+            autoLeftKeybindBtn. BackgroundColor3 = Color3.fromRGB(0, 0, 0)
+            instructionText.Text = "Press any key for Left..."
+            instructionText.TextColor3 = Color3.fromRGB(255, 150, 150)
+        end
+    end)
+    
+    autoRightKeybindBtn.Activated:Connect(function()
+        if not isEditingKeybind then
+            isEditingKeybind = true
+            currentEditingAction = "autoRight"
+            autoRightKeybindBtn.Text = "PRESS KEY FOR RIGHT"
+            autoRightKeybindBtn. BackgroundColor3 = Color3.fromRGB(0, 0, 0)
+            instructionText.Text = "Press any key for Right..."
+            instructionText.TextColor3 = Color3.fromRGB(255, 150, 150)
+        end
+    end)
+    
+    stopKeybindBtn.Activated:Connect(function()
+        if not isEditingKeybind then
+            isEditingKeybind = true
+            currentEditingAction = "stopMovement"
+            stopKeybindBtn.Text = "PRESS KEY FOR STOP"
+            stopKeybindBtn. BackgroundColor3 = Color3.fromRGB(0, 0, 0)
+            instructionText.Text = "Press any key for Stop..."
+            instructionText.TextColor3 = Color3.fromRGB(255, 150, 150)
+        end
+    end)
+    
+    -- Close button
+    local closeButton = Instance.new("TextButton")
+    closeButton.Name = "CloseEditorBtn"
+    closeButton.Text = "✅ SAVE & CLOSE"
+    closeButton.Size = UDim2.new(0.8, 0, 0, 25)
+    closeButton.Position = UDim2.new(0.1, 0, 0.85, 0)
+    closeButton. BackgroundColor3 = Color3.fromRGB(0, 0, 0)
+    closeButton.TextColor3 = Color3.new(1, 1, 1)
+    closeButton.Font = Enum.Font.GothamBold
+    closeButton.TextSize = 10
+    closeButton.ZIndex = 1001
+    closeButton.Parent = keybindEditorFrame
+    
+    Instance.new("UICorner", closeButton).CornerRadius = UDim.new(0, 5)
+    
+    closeButton.Activated:Connect(function()
+        keybindEditorFrame.Visible = false
+        mainFrame.Visible = true
+        isEditingKeybind = false
+        currentEditingAction = nil
+        saveKeybinds()
+        print("Keybinds saved and editor closed!")
+    end)
+    
+    return keybindEditorFrame
+end
+
+-- UI Container for main buttons
+local buttonContainer = Instance.new("Frame")
+buttonContainer.Size = UDim2.new(0.9, 0, 0, 90)
+buttonContainer.Position = UDim2.new(0.05, 0, 0, 65)
+buttonContainer.BackgroundTransparency = 1
+buttonContainer.ZIndex = 11
+buttonContainer.Parent = mainFrame
+
+local uiList = Instance.new("UIListLayout")
+uiList.Padding = UDim.new(0, 8)
+uiList.Parent = buttonContainer
+
+-- Toggle function for auto movement
+local function toggleAutoMovement(type)
+    if type == "right" then
+        if isAutoRightActive then
+            isAutoRightActive = false
+            statusLabel.Text = "⏹️ STOPPED"
+            statusLabel.TextColor3 = Color3.fromRGB(255, 100, 100)
+            stopMoving()
+        else
+            if isAutoLeftActive then
+                isAutoLeftActive = false
+            end
+            
+            isAutoRightActive = true
+            statusLabel.Text = "🌠 AUTO RIGHT [ACTIVE]"
+            statusLabel.TextColor3 = Color3.fromRGB(100, 255, 150)
+            
+            stopMoving()
+            waypoints = {
+                {position = Vector3.new(-474, -7, 29), speed = 58.5},
+                {position = Vector3.new(-473, -7, 29), speed = 58.5},
+                {position = Vector3.new(-478, -6, 25), speed = 58.5},
+                {position = Vector3.new(-488, -5, 23), speed = 58.5},
+                {position = Vector3.new(-488, -5, 23), speed = 58.5},
+                {position = Vector3.new(-474, -7, 29), speed = 29},
+                {position = Vector3.new(-474, -7, 29), speed = 29},
+                {position = Vector3.new(-475, -7, 118), speed = 29},
+                {position = Vector3.new(-475, -7, 118), speed = 29}
+            }
+            moving = true
+            currentWaypoint = 1
+            moveToWaypoint()
+        end
+    elseif type == "left" then
+        if isAutoLeftActive then
+            isAutoLeftActive = false
+            statusLabel.Text = "⏹️ STOPPED"
+            statusLabel.TextColor3 = Color3.fromRGB(255, 100, 100)
+            stopMoving()
+        else
+            if isAutoRightActive then
+                isAutoRightActive = false
+            end
+            
+            isAutoLeftActive = true
+            statusLabel.Text = "⬛️ AUTO LEFT [ACTIVE]"
+            statusLabel.TextColor3 = Color3.fromRGB(100, 255, 150)
+            
+            stopMoving()
+            waypoints = {
+                {position = Vector3.new(-475, -7, 90), speed = 58.5},
+                {position = Vector3.new(-475, -7, 90), speed = 58.5},
+                {position = Vector3.new(-479, -5, 95), speed = 58.5},
+                {position = Vector3.new(-479, -5, 95), speed = 58.5},
+                {position = Vector3.new(-486, -5, 97), speed = 58.5},
+                {position = Vector3.new(-486, -5, 97), speed = 58.5},
+                {position = Vector3.new(-474, -7, 92), speed = 29},
+                {position = Vector3.new(-474, -7, 92), speed = 29},
+                {position = Vector3.new(-474, -7, -1), speed = 29}
+            }
+            moving = true
+            currentWaypoint = 1
+            moveToWaypoint()
+        end
+    end
+end
+
+-- Button creation function
+local function createButton(name, type)
+    local button = Instance.new("TextButton")
+    button.Text = name
+    button.Size = UDim2.new(1, 0, 0, 35)
+    button. BackgroundColor3 = Color3.fromRGB(0, 0, 0)
+    button.BackgroundTransparency = 0.1
+    button.TextColor3 = Color3.new(1, 1, 1)
+    button.Font = Enum.Font.GothamBold
+    button.TextSize = 13
+    button.ZIndex = 12
+    button.Parent = buttonContainer
+    
+    Instance.new("UICorner", button).CornerRadius = UDim.new(0, 8)
+    
+    local buttonStroke = Instance.new("UIStroke")
+    buttonStroke.Thickness = 1.5
+    buttonStroke.Color = Color3.fromRGB(150, 100, 255)
+    buttonStroke.Parent = button
+    
+    button.Activated:Connect(function()
+        toggleAutoMovement(type)
+    end)
+    
+    return button
+end
+
+-- Create main buttons
+local autoRightButton = createButton("⬛️ AUTO RIGHT", "right")
+local autoLeftButton = createButton("⬜️ AUTO LEFT", "left")
+
+-- Create EDIT KEYBINDS button
+local editKeybindsButton = Instance.new("TextButton")
+editKeybindsButton.Text = "✏️ EDIT KEYBINDS"
+editKeybindsButton.Size = UDim2.new(0.9, 0, 0, 35)
+editKeybindsButton.Position = UDim2.new(0.05, 0, 0, 165)
+editKeybindsButton. BackgroundColor3 = Color3.fromRGB(0, 0, 0)
+editKeybindsButton.BackgroundTransparency = 0.1
+editKeybindsButton.TextColor3 = Color3.new(1, 1, 1)
+editKeybindsButton.Font = Enum.Font.GothamBold
+editKeybindsButton.TextSize = 13
+editKeybindsButton.ZIndex = 11
+editKeybindsButton.Parent = mainFrame
+
+Instance.new("UICorner", editKeybindsButton).CornerRadius = UDim.new(0, 8)
+
+local editStroke = Instance.new("UIStroke", editKeybindsButton)
+editStroke.Thickness = 1.5
+editStroke.Color = Color3.fromRGB(255, 100, 255)
+
+-- ========== DRAGGABLE UI LOGIC ==========
+local function makeDraggable(element)
+    element.InputBegan:Connect(function(input)
+        if uiLocked then return end
+        
+        if input.UserInputType == Enum.UserInputType.MouseButton1 or 
+           input.UserInputType == Enum.UserInputType.Touch then
+            dragging = true
+            dragElement = element
+            dragStart = input.Position
+            startPos = element.Position
+            
+            local connection
+            connection = input.
+Changed:Connect(function()
+                if input.UserInputState == Enum.UserInputState.End then
+                    dragging = false
+                    dragElement = nil
+                    if connection then connection:Disconnect() end
+                end
+            end)
+        end
+    end)
+end
+
+-- Make all UI elements draggable
+makeDraggable(batTargetButton)
+makeDraggable(jumpButton)
+makeDraggable(unwalkButton)
+makeDraggable(toggleUIButton)
+makeDraggable(mainFrame)
+makeDraggable(lockButton)
+
+-- Dragging movement handler
+UserInputService.InputChanged:Connect(function(input)
+    if uiLocked or not dragging or not dragElement then return end
+    
+    if input.UserInputType == Enum.UserInputType.MouseMovement or 
+       input.UserInputType == Enum.UserInputType.Touch then
+        
+        local delta = input.Position - dragStart
+        local newX = startPos.X.Offset + delta.X
+        local newY = startPos.Y.Offset + delta.Y
+        
+        dragElement.Position = UDim2.new(startPos.X.Scale, newX, startPos.Y.Scale, newY)
+    end
+end)
+
+-- ========== BUTTON FUNCTIONALITY ==========
+-- Lock button functionality
+lockButton.MouseButton1Click:Connect(function()
+    uiLocked = not uiLocked
+    if uiLocked then
+        lockButton.Text = "🔒"
+        lockButton. BackgroundColor3 = Color3.fromRGB(0, 0, 0)
+        if dragging then
+            dragging = false
+            dragElement = nil
+        end
+    else
+        lockButton.Text = "🔓"
+        lockButton. BackgroundColor3 = Color3.fromRGB(0, 0, 0)
+    end
+end)
+
+-- Bat Target toggle
+batTargetButton.MouseButton1Click:Connect(function()
+    batActive = not batActive
+    
+    if batActive then
+        batTargetButton.Text = "BAT TARGET: ON"
+        batTargetButton. BackgroundColor3 = Color3.fromRGB(0, 0, 0)
+        lookAtTarget(true)
+    else
+        batTargetButton.Text = "BAT TARGET: OFF"
+        batTargetButton. BackgroundColor3 = Color3.fromRGB(0, 0, 0)
+        lookAtTarget(false)
+    end
+end)
+
+-- Infinity Jump toggle
+jumpButton.MouseButton1Click:Connect(function()
+    infinityJumpEnabled = not infinityJumpEnabled
+    
+    if infinityJumpEnabled then
+        jumpButton.Text = "INF JUMP: ON"
+        jumpButton. BackgroundColor3 = Color3.fromRGB(0, 0, 0)
+    else
+        jumpButton.Text = "INF JUMP: OFF"
+        jumpButton. BackgroundColor3 = Color3.fromRGB(0, 0, 0)
+    end
+end)
+
+-- Unwalk toggle
+unwalkButton.MouseButton1Click:Connect(function()
+    unwalkEnabled = not unwalkEnabled
+    
+    if unwalkEnabled then
+        unwalkButton.Text = "UNWALK: ON"
+        unwalkButton. BackgroundColor3 = Color3.fromRGB(0, 0, 0)
+        enableUnwalk()
+    else
+        unwalkButton.Text = "UNWALK: OFF"
+        unwalkButton. BackgroundColor3 = Color3.fromRGB(0, 0, 0)
+        disableUnwalk()
+    end
+end)
+
+-- Toggle UI button
+toggleUIButton.Activated:Connect(function() 
+    mainFrame.Visible = not mainFrame.Visible 
+    if keybindEditorFrame then
+        keybindEditorFrame.Visible = false
+    end
+    isEditingKeybind = false
+    currentEditingAction = nil
+end)
+
+-- Edit Keybinds button
+editKeybindsButton.MouseEnter:Connect(function()
+    editKeybindsButton. BackgroundColor3 = Color3.fromRGB(0, 0, 0)
+end)
+
+editKeybindsButton.MouseLeave:Connect(function()
+    editKeybindsButton. BackgroundColor3 = Color3.fromRGB(0, 0, 0)
+end)
+
+editKeybindsButton.Activated:Connect(function()
+    mainFrame.Visible = false
+    if keybindEditorFrame then
+        keybindEditorFrame.Visible = true
+    end
+    isEditingKeybind = false
+    currentEditingAction = nil
+end)
+
+-- Keyboard input handling for keybind editing
+UserInputService.InputBegan:Connect(function(input, gameProcessed)
+    if not isEditingKeybind or gameProcessed then return end
+    
+    if input.UserInputType == Enum.UserInputType.Keyboard then
+        local newKey = input.KeyCode
+        
+        if currentEditingAction == "autoLeft" then
+            keybindsData.autoLeft = newKey
+            if keybindEditorFrame then
+                local keybindContainer = keybindEditorFrame:FindFirstChild("KeybindContainer")
+                if keybindContainer then
+                    local leftBtn = keybindContainer:FindFirstChild("AutoLeftKeybindBtn")
+                    if leftBtn then
+                        leftBtn.Text = "LEFT: " .. newKey.Name
+                        leftBtn. BackgroundColor3 = Color3.fromRGB(0, 0, 0)
+                    end
+                end
+            end
+            updateKeybindDisplay()
+            
+        elseif currentEditingAction == "autoRight" then
+            keybindsData.autoRight = newKey
+            if keybindEditorFrame then
+                local keybindContainer = keybindEditorFrame:FindFirstChild("KeybindContainer")
+                if keybindContainer then
+                    local rightBtn = keybindContainer:FindFirstChild("AutoRightKeybindBtn")
+                    if rightBtn then
+                        rightBtn.Text = "RIGHT: " .. newKey.Name
+                        rightBtn. BackgroundColor3 = Color3.fromRGB(0, 0, 0)
+                    end
+                end
+            end
+            updateKeybindDisplay()
+            
+        elseif currentEditingAction == "stopMovement" then
+            keybindsData.stopMovement = newKey
+            if keybindEditorFrame then
+                local keybindContainer = keybindEditorFrame:FindFirstChild("KeybindContainer")
+                if keybindContainer then
+                    local stopBtn = keybindContainer:FindFirstChild("StopKeybindBtn")
+                    if stopBtn then
+                        stopBtn.Text = "STOP: " .. newKey.Name
+                        stopBtn. BackgroundColor3 = Color3.fromRGB(0, 0, 0)
+                    end
+                end
+            end
+            updateKeybindDisplay()
+        end
+        
+        -- Reset editing state
+        isEditingKeybind = false
+        currentEditingAction = nil
+        
+        -- Update instruction text
+        if keybindEditorFrame then
+            local instruction = keybindEditorFrame:FindFirstChild("InstructionText")
+            if instruction then
+                instruction.Text = "Tap button to change"
+                instruction.TextColor3 = Color3.fromRGB(150, 250, 150)
+            end
+        end
+    end
+end)
+
+-- Keyboard input handling for movement
+UserInputService.InputBegan:Connect(function(input, gameProcessed)
+    if gameProcessed or isEditingKeybind then return end
+    
+    if input.KeyCode == keybindsData.autoRight then
+        toggleAutoMovement("right")
+    elseif input.KeyCode == keybindsData.autoLeft then
+        toggleAutoMovement("left")
+    elseif input.KeyCode == keybindsData.stopMovement then
+        if isAutoRightActive then
+            isAutoRightActive = false
+        end
+        if isAutoLeftActive then
+            isAutoLeftActive = false
+        end
+        stopMoving()
+        statusLabel.Text = "⏹️ STOPPED"
+        statusLabel.TextColor3 = Color3.fromRGB(255, 100, 100)
+    end
+end)
+
+-- ========== GAME LOGIC LOOPS ==========
+-- FPS/Ping display
+RunService.RenderStepped:Connect(function()
+    local fps = math.floor(1/RunService.RenderStepped:Wait())
+    local ping = math.floor(Stats.Network.ServerStatsItem["Data Ping"]:GetValue())
+    statsLabel.Text = string.format("FPS: %d | PING: %dms", fps, ping)
+end)
+
+-- Infinity jump logic
+RunService.Heartbeat:Connect(function()
+    if infinityJumpEnabled then
+        local char = player.Character
+        if not char then return end
+
+        local hrp = char:FindFirstChild("HumanoidRootPart")
+        if hrp then
+            if batActive then
+                local target = nearestPlayer()
+                if target then
+                    local targetPos = target.Position
+                    local myPos = hrp.Position
+                    
+                    if targetPos.Y > myPos.Y + 5 then
+                        hrp.Velocity = Vector3.new(hrp.Velocity.X, math.max(jumpForce, hrp.Velocity.Y), hrp.Velocity.Z)
+                    end
+                end
+            end
+            
+            if hrp.Velocity.Y < -clampFallSpeed then
+                hrp.Velocity = Vector3.new(hrp.Velocity.X, -clampFallSpeed, hrp.Velocity.Z)
+            end
+        end
+    end
+end)
+
+UserInputService.JumpRequest:Connect(function()
+    if not infinityJumpEnabled then return end
+    local char = player.Character
+    if not char then return end
+
+    local hrp = char:FindFirstChild("HumanoidRootPart")
+    if hrp then
+        hrp.Velocity = Vector3.new(hrp.Velocity.X, jumpForce, hrp.Velocity.Z)
+    end
+end)
+
+-- Bat target bot loop
+RunService.Heartbeat:Connect(function()
+    if not batActive then return end
+
+    local hrp = rootPart()
+    if not hrp then return end
+    hrp.CanCollide = false
+
+    local target, distance = nearestPlayer()
+    if not target then return end
+
+    local targetPos = Vector3.new(target.Position.X, target.Position.Y, target.Position.Z)
+    local moveDir = (targetPos - hrp.Position).Unit
+    
+    hrp.AssemblyLinearVelocity = moveDir * moveSpeed
+
+    if infinityJumpEnabled then
+        if targetPos.Y > hrp.Position.Y + 3 then
+            hrp.AssemblyLinearVelocity = Vector3.new(
+                hrp.AssemblyLinearVelocity.X,
+                math.min(jumpForce, moveSpeed * 0.5),
+                hrp.AssemblyLinearVelocity.Z
+            )
+        end
+    end
+
+    if distance <= engageRange then
+        if tick() - lastEquipTick >= 0.3 then
+            equipBat()
+            lastEquipTick = tick()
+        end
+
+        if tick() - lastUseTick >= 0.3 then
+            local char = character()
+            local batTool = char and char:FindFirstChild("Bat")
+            if batTool then
+                batTool:Activate()
+            end
+            lastUseTick = tick()
+        end
+    end
+end)
+
+-- Reapply unwalk when character respawns
+player.CharacterAdded:Connect(function()
+    wait(1)
+    
+    if unwalkEnabled then
+        task.spawn(function()
+            local char = player.Character
+            scan(char)
+            if watcher then watcher:Disconnect() end
+            watcher = char.DescendantAdded:Connect(added)
+        end)
+    end
+end)
+
+-- Initialize
+loadKeybinds()
+updateKeybindDisplay()
+
+-- Create keybind editor
+task.wait(0.5)
+createKeybindEditorUI()
+
+print("=========================================")
+print("Galaxy Combo UI v6.0 - LOADED")
+print("Features:")
+print("- Galaxy Duel Rush (A/D/S keys)")
+print("- Bat Target Bot")
+print("- Infinity Jump")
+print("- Unwalk System")
+print("- All buttons purple themed")
+print("- All UI elements draggable")
+print("- Lock/Unlock system")
+print("=========================================")
+print("Click 🌌 to open Galaxy Duel Rush panel")
+print("Purple buttons: Bat Target, Infinity Jump, Unwalk")
+print("All UI can be moved (drag any button)")
+print("Use 🔓/🔒 to lock/unlock UI")
+print("=========================================")
+
+-- =========================
+-- GALAXY AUTOGRAB (STANDALONE)
+-- =========================
+
+local Players = game:GetService("Players")
+local TweenService = game:GetService("TweenService")
+local RunService = game:GetService("RunService")
+local UserInputService = game:GetService("UserInputService")
+local HttpService = game:GetService("HttpService")
+
+local LocalPlayer = Players.LocalPlayer
+local PlayerGui = LocalPlayer:WaitForChild("PlayerGui")
+
+local isMobile = UserInputService.TouchEnabled and not UserInputService.KeyboardEnabled
+local isTablet = UserInputService.TouchEnabled and UserInputService.KeyboardEnabled
+local isPC = not UserInputService.TouchEnabled
+
+if not getconnections then
+    getconnections = function() return {} end
+end
+
+-- ========================
+-- ANIMATION SYSTEM
+-- ========================
+local activeGradients = {}
+local animationAngle = 0
+local rainbowHue = 0
+
+local function registerGradient(gradient)
+    table.insert(activeGradients, gradient)
+end
+
+local gradientUpdateCounter = 0
+RunService.Heartbeat:Connect(function(dt)
+    gradientUpdateCounter = gradientUpdateCounter + 1
+    if gradientUpdateCounter % 2 ~= 0 then return end
+
+    animationAngle = (animationAngle + (dt * 120)) % 360
+    rainbowHue = (rainbowHue + (dt * 0.3)) % 1
+    
+    for i = #activeGradients, 1, -1 do
+        local grad = activeGradients[i]
+        if grad and grad.Parent then
+            grad.Rotation = animationAngle
+        else
+            table.remove(activeGradients, i)
+        end
+    end
+end)
+
+-- Galaxy color palette: deep space blues, indigo, violet, nebula purple, cyan accent
+local GALAXY_COLORS = {
+    Color3.fromRGB(10,  10,  80),   -- deep space navy
+    Color3.fromRGB(50,  0,   160),  -- indigo
+    Color3.fromRGB(120, 0,   220),  -- violet
+    Color3.fromRGB(180, 60,  255),  -- nebula purple
+    Color3.fromRGB(80,  0,   200),  -- deep violet
+    Color3.fromRGB(0,   120, 255),  -- electric blue
+    Color3.fromRGB(0,   200, 255),  -- nebula cyan
+    Color3.fromRGB(100, 0,   200),  -- violet
+    Color3.fromRGB(30,  0,   120),  -- midnight blue
+}
+
+local function createRainbowGradient(instance, speed)
+    speed = speed or 1
+    local gradient = Instance.new("UIGradient")
+    gradient.Parent = instance
+
+    local function updateGalaxy()
+        local t = tick() * speed * 0.12
+        local n = #GALAXY_COLORS
+        local stops = {}
+        for k = 0, 5 do
+            local frac = k / 5
+            local idx = ((t + frac * 2) % n)
+            local lo = GALAXY_COLORS[math.floor(idx) % n + 1]
+            local hi = GALAXY_COLORS[math.ceil(idx) % n + 1]
+            local blend = idx % 1
+            local c = Color3.new(
+                lo.R + (hi.R - lo.R) * blend,
+                lo.G + (hi.G - lo.G) * blend,
+                lo.B + (hi.B - lo.B) * blend
+            )
+            table.insert(stops, ColorSequenceKeypoint.new(frac == 1 and 1 or frac, c))
+        end
+        gradient.Color = ColorSequence.new(stops)
+    end
+
+    RunService.Heartbeat:Connect(updateGalaxy)
+    registerGradient(gradient)
+    return gradient
+end
+
+-- ========================
+-- THEME COLORS
+-- ========================
+local Theme = {
+    Primary = Color3.fromRGB(72, 0, 180),
+    Secondary = Color3.fromRGB(0, 180, 255),
+    Accent = Color3.fromRGB(180, 80, 255),
+    Background = Color3.fromRGB(4, 6, 18),
+    Background2 = Color3.fromRGB(8, 10, 28),
+    Background3 = Color3.fromRGB(14, 16, 38),
+    Text = Color3.fromRGB(255, 255, 255),
+    TextSecondary = Color3.fromRGB(160, 170, 210),
+}
+
+-- ========================
+-- CONFIGURATION SYSTEM
+-- ========================
+local lastUpdateTimes = {}
+local function shouldUpdate(key, interval)
+    local now = tick()
+    if not lastUpdateTimes[key] or (now - lastUpdateTimes[key]) >= interval then
+        lastUpdateTimes[key] = now
+        return true
+    end
+    return false
+end
+
+local CONFIG_FILE = "AutoGrabConfig.json"
+
+local function saveConfig(data)
+    if writefile then
+        pcall(function()
+            writefile(CONFIG_FILE, HttpService:JSONEncode(data))
+        end)
+    end
+end
+
+local function loadConfig()
+    if readfile and isfile then
+        if isfile(CONFIG_FILE) then
+            local success, result = pcall(function()
+                return HttpService:JSONDecode(readfile(CONFIG_FILE))
+            end)
+            if success then return result end
+        end
+    end
+    return {
+        autoGrabEnabled = false,
+        grabRadius = 20,
+        uiPositionX = nil,
+        uiPositionY = nil,
+    }
+end
+
+local config = loadConfig()
+
+-- ========================
+-- CORE VARIABLES
+-- ========================
+local autoGrabEnabled = false
+local GRAB_RADIUS = config.grabRadius or 20
+
+local allAnimalsCache = {}
+local internalGrabCache = {}
+local cachedPrompts = {}
+local grabConnection = nil
+local isActivelyGrabbing = false
+local lastGrabAttempt = 0
+local GRAB_COOLDOWN = 0.1
+local GRAB_DURATION = 0.1
+local grabStartTime = nil
+local currentGrabTarget = nil
+local animalScannerRunning = false
+
+-- UI Elements
+local autoGrabProgressFrame = nil
+local barProgressBg = nil
+local barProgressFill = nil
+local progressText = nil
+
+-- Circle Parts
+local CIRCLE_SEGMENTS = 80
+local SEGMENT_HEIGHT = 0.2
+local SEGMENT_THICKNESS = 0.3
+local circleParts = {}
+
+-- ========================
+-- UTILITY FUNCTIONS
+-- ========================
+local function getHRP()
+    local c = LocalPlayer.Character
+    if not c then return nil end
+    return c:FindFirstChild("HumanoidRootPart") or c:FindFirstChild("UpperTorso") or c.PrimaryPart
+end
+
+-- ========================
+-- VISUAL CIRCLE SYSTEM
+-- ========================
+local function destroyCircleParts()
+    for _, part in ipairs(circleParts) do
+        if part and part.Parent then part:Destroy() end
+    end
+    circleParts = {}
+    pcall(function()
+        RunService:UnbindFromRenderStep("AutoGrabCircleFollow")
+    end)
+end
+
+local function createCircleBorder()
+    destroyCircleParts()
+
+    local char = LocalPlayer.Character
+    if not char then return end
+    local root = char:FindFirstChild("HumanoidRootPart")
+    if not root then return end
+
+    local points = {}
+    for i = 0, CIRCLE_SEGMENTS - 1 do
+        local angle = math.rad(i * 360 / CIRCLE_SEGMENTS)
+        table.insert(points, Vector3.new(math.cos(angle), 0, math.sin(angle)) * GRAB_RADIUS)
+    end
+
+    for i = 1, #points do
+        local nextIndex = i % #points + 1
+        local p1 = points[i]
+        local p2 = points[nextIndex]
+
+        local part = Instance.new("Part")
+        part.Anchored = true
+        part.CanCollide = false
+        part.Size = Vector3.new((p2 - p1).Magnitude, SEGMENT_HEIGHT, SEGMENT_THICKNESS)
+        part.Color = Color3.fromRGB(255, 255, 255)
+        part.Material = Enum.Material.Neon
+        part.Transparency = 0.15
+        part.TopSurface = Enum.SurfaceType.Smooth
+        part.BottomSurface = Enum.SurfaceType.Smooth
+        part.CastShadow = false
+        part.Parent = workspace
+        
+        if i % 4 == 0 then
+            local sparkle = Instance.new("ParticleEmitter")
+            sparkle.Parent = part
+            sparkle.Texture = "rbxassetid://1084976679"
+            sparkle.Rate = 2
+            sparkle.Lifetime = NumberRange.new(0.3, 0.6)
+            sparkle.Speed = NumberRange.new(0.5, 1)
+            sparkle.SpreadAngle = Vector2.new(180, 180)
+            sparkle.Size = NumberSequence.new(0.1, 0)
+            sparkle.Transparency = NumberSequence.new(0.5, 1)
+            sparkle.LightEmission = 1
+            sparkle.Color = ColorSequence.new(Color3.fromRGB(255, 255, 255))
+        end
+        
+        table.insert(circleParts, part)
+    end
+
+    RunService:BindToRenderStep("AutoGrabCircleFollow", Enum.RenderPriority.Camera.Value + 1, function()
+        local r = char:FindFirstChild("HumanoidRootPart")
+        if not r then return end
+
+        local pts = {}
+        for i = 0, CIRCLE_SEGMENTS - 1 do
+            local angle = math.rad(i * 360 / CIRCLE_SEGMENTS)
+            table.insert(pts, Vector3.new(math.cos(angle), 0, math.sin(angle)) * GRAB_RADIUS)
+        end
+
+        local time = tick()
+        for idx, p in ipairs(circleParts) do
+            if p and p.Parent then
+                local nextIndex = idx % #pts + 1
+                local a = pts[idx]
+                local b = pts[nextIndex]
+                local center = (a + b) / 2 + Vector3.new(r.Position.X, r.Position.Y - 2.8, r.Position.Z)
+                p.Size = Vector3.new((b - a).Magnitude, SEGMENT_HEIGHT, SEGMENT_THICKNESS)
+                p.CFrame = CFrame.new(center, center + Vector3.new(b.X - a.X, 0, b.Z - a.Z)) * CFrame.Angles(0, math.pi / 2, 0)
+                
+                local hue = (time * 0.5 + (idx / #circleParts)) % 1
+                p.Color = Color3.fromHSV(hue, 0.9, 1)
+            end
+        end
+    end)
+end
+
+local function updateRadiusCircle()
+    destroyCircleParts()
+    if autoGrabEnabled then
+        createCircleBorder()
+    end
+end
+
+-- ========================
+-- UI CREATION
+-- ========================
+local screenGui = Instance.new("ScreenGui")
+screenGui.Name = "GalaxyAutoGrab"
+screenGui.ResetOnSpawn = false
+screenGui.DisplayOrder = 1000
+screenGui.Parent = PlayerGui
+
+local function createAutoGrabUI()
+    -- ========================
+    -- COMPACT BAR UI
+    -- Bar width: wide enough for label + switch + status + radius slider
+    -- ========================
+    local barW = isMobile and 200 or 240
+    local barH = isMobile and 36 or 42
+
+    autoGrabProgressFrame = Instance.new("Frame")
+    autoGrabProgressFrame.Name = "GalaxyAutoGrabPanel"
+    autoGrabProgressFrame.Size = UDim2.new(0, barW, 0, barH)
+    autoGrabProgressFrame.BackgroundColor3 = Theme.Background
+    autoGrabProgressFrame.BackgroundTransparency = 0.08
+    autoGrabProgressFrame.Active = true
+    autoGrabProgressFrame.ClipsDescendants = false
+    autoGrabProgressFrame.Parent = screenGui
+
+    Instance.new("UICorner", autoGrabProgressFrame).CornerRadius = UDim.new(1, 0)
+
+    -- Rainbow border stroke
+    local borderStroke = Instance.new("UIStroke")
+    borderStroke.Thickness = 2
+    borderStroke.Transparency = 0.1
+    borderStroke.Parent = autoGrabProgressFrame
+    createRainbowGradient(borderStroke, 1.2)
+
+    -- Subtle outer glow
+    local outerGlow = Instance.new("ImageLabel")
+    outerGlow.Name = "OuterGlow"
+    outerGlow.Size = UDim2.new(1, 40, 1, 40)
+    outerGlow.Position = UDim2.new(0.5, 0, 0.5, 0)
+    outerGlow.AnchorPoint = Vector2.new(0.5, 0.5)
+    outerGlow.BackgroundTransparency = 1
+    outerGlow.Image = "rbxassetid://5028857084"
+    outerGlow.ImageColor3 = Color3.fromRGB(72, 0, 180)
+    outerGlow.ImageTransparency = 0.75
+    outerGlow.ZIndex = -1
+    outerGlow.Parent = autoGrabProgressFrame
+    createRainbowGradient(outerGlow, 1.0)
+
+    -- Default position
+    if config.uiPositionX and config.uiPositionY then
+        autoGrabProgressFrame.Position = UDim2.new(0, config.uiPositionX, 0, config.uiPositionY)
+    else
+        autoGrabProgressFrame.Position = UDim2.new(0.5, -barW / 2, 0, 20)
+    end
+
+    -- Drag logic (unchanged)
+    do
+        local dragging = false
+        local dragStartPos = nil
+        local frameStartPos = nil
+        local saving = false
+
+        local function onDragStart(inputPos)
+            dragging = true
+            dragStartPos = inputPos
+            frameStartPos = autoGrabProgressFrame.AbsolutePosition
+        end
+
+        local function onDragMove(inputPos)
+            if not dragging then return end
+            local delta = inputPos - dragStartPos
+            local newX = frameStartPos.X + delta.X
+            local newY = frameStartPos.Y + delta.Y
+            autoGrabProgressFrame.Position = UDim2.new(0, newX, 0, newY)
+        end
+
+        local function onDragEnd()
+            if not dragging then return end
+            dragging = false
+            if not saving then
+                saving = true
+                task.delay(0.5, function()
+                    config.uiPositionX = autoGrabProgressFrame.AbsolutePosition.X
+                    config.uiPositionY = autoGrabProgressFrame.AbsolutePosition.Y
+                    saveConfig(config)
+                    saving = false
+                end)
+            end
+        end
+
+        autoGrabProgressFrame.InputBegan:Connect(function(input)
+            if input.UserInputType == Enum.UserInputType.MouseButton1
+            or input.UserInputType == Enum.UserInputType.Touch then
+                onDragStart(Vector2.new(input.Position.X, input.Position.Y))
+            end
+        end)
+
+        UserInputService.InputChanged:Connect(function(input)
+            if input.UserInputType == Enum.UserInputType.MouseMovement
+            or input.UserInputType == Enum.UserInputType.Touch then
+                onDragMove(Vector2.new(input.Position.X, input.Position.Y))
+            end
+        end)
+
+        UserInputService.InputEnded:Connect(function(input)
+            if input.UserInputType == Enum.UserInputType.MouseButton1
+            or input.UserInputType == Enum.UserInputType.Touch then
+                onDragEnd()
+            end
+        end)
+    end
+
+    -- ========================
+    -- LAYOUT: [SWITCH] [STATUS BAR] [R: input]
+    -- ========================
+    local pad = isMobile and 8 or 10
+    local innerH = barH - 10
+
+    -- ========================
+    -- TOGGLE SWITCH
+    -- ========================
+    local switchW = isMobile and 34 or 40
+    local switchH = isMobile and 18 or 22
+    local switchX = pad
+
+    local switchBg = Instance.new("TextButton")
+    switchBg.Name = "SwitchBg"
+    switchBg.Size = UDim2.new(0, switchW, 0, switchH)
+    switchBg.Position = UDim2.new(0, switchX, 0.5, 0)
+    switchBg.AnchorPoint = Vector2.new(0, 0.5)
+    switchBg.BackgroundColor3 = Color3.fromRGB(60, 60, 80)
+    switchBg.AutoButtonColor = false
+    switchBg.Text = ""
+    switchBg.ZIndex = 5
+    switchBg.Parent = autoGrabProgressFrame
+    Instance.new("UICorner", switchBg).CornerRadius = UDim.new(1, 0)
+
+    local switchKnob = Instance.new("Frame")
+    switchKnob.Name = "SwitchKnob"
+    switchKnob.Size = UDim2.new(0, switchH - 4, 0, switchH - 4)
+    switchKnob.Position = UDim2.new(0, 2, 0.5, 0)
+    switchKnob.AnchorPoint = Vector2.new(0, 0.5)
+    switchKnob.BackgroundColor3 = Color3.fromRGB(180, 180, 200)
+    switchKnob.ZIndex = 6
+    switchKnob.Parent = switchBg
+    Instance.new("UICorner", switchKnob).CornerRadius = UDim.new(1, 0)
+
+    -- powerStroke needed by updatePowerButton — attach to switchBg acting as the "button"
+    local powerStroke = Instance.new("UIStroke")
+    powerStroke.Color = Color3.fromRGB(80, 80, 100)
+    powerStroke.Thickness = 1.5
+    powerStroke.Parent = switchBg
+
+    -- statusDot (hidden — kept for updatePowerButton compat, zero size)
+    local statusDot = Instance.new("Frame")
+    statusDot.Size = UDim2.new(0, 0, 0, 0)
+    statusDot.BackgroundTransparency = 1
+    statusDot.Parent = switchBg
+    Instance.new("UICorner", statusDot).CornerRadius = UDim.new(1, 0)
+
+    -- powerIcon & powerLabel (zero-size, kept for updatePowerButton compat)
+    local powerIcon = Instance.new("ImageLabel")
+    powerIcon.Size = UDim2.new(0, 0, 0, 0)
+    powerIcon.BackgroundTransparency = 1
+    powerIcon.Image = "rbxassetid://7733920644"
+    powerIcon.Parent = switchBg
+
+    local powerLabel = Instance.new("TextLabel")
+    powerLabel.Size = UDim2.new(0, 0, 0, 0)
+    powerLabel.BackgroundTransparency = 1
+    powerLabel.Text = ""
+    powerLabel.Parent = switchBg
+
+    local function updatePowerButton(enabled)
+        local tweenInfo = TweenInfo.new(0.25, Enum.EasingStyle.Quint, Enum.EasingDirection.Out)
+        if enabled then
+            TweenService:Create(switchBg, tweenInfo, {BackgroundColor3 = Color3.fromRGB(72, 0, 180)}):Play()
+            TweenService:Create(switchKnob, tweenInfo, {
+                Position = UDim2.new(0, switchW - (switchH - 4) - 2, 0.5, 0),
+                BackgroundColor3 = Color3.fromRGB(255, 255, 255)
+            }):Play()
+            createRainbowGradient(powerStroke, 1.5)
+        else
+            TweenService:Create(switchBg, tweenInfo, {BackgroundColor3 = Color3.fromRGB(60, 60, 80)}):Play()
+            TweenService:Create(switchKnob, tweenInfo, {
+                Position = UDim2.new(0, 2, 0.5, 0),
+                BackgroundColor3 = Color3.fromRGB(180, 180, 200)
+            }):Play()
+            for _, child in ipairs(powerStroke:GetChildren()) do
+                if child:IsA("UIGradient") then child:Destroy() end
+            end
+            powerStroke.Color = Color3.fromRGB(80, 80, 100)
+        end
+    end
+
+    local powerButton = switchBg  -- alias so the click below works
+    powerButton.MouseButton1Click:Connect(function()
+        autoGrabEnabled = not autoGrabEnabled
+        updatePowerButton(autoGrabEnabled)
+        toggleAutoGrab(autoGrabEnabled)
+    end)
+
+    -- ========================
+    -- STATUS BAR (progress bar)
+    -- ========================
+    local statusBarX = switchX + switchW + pad
+    local statusBarW = isMobile and 60 or 72
+
+    -- Outer track
+    barProgressBg = Instance.new("Frame")
+    barProgressBg.Name = "BarBg"
+    barProgressBg.Size = UDim2.new(0, statusBarW, 0, switchH)
+    barProgressBg.Position = UDim2.new(0, statusBarX, 0.5, 0)
+    barProgressBg.AnchorPoint = Vector2.new(0, 0.5)
+    barProgressBg.BackgroundColor3 = Theme.Background3
+    barProgressBg.ClipsDescendants = true
+    barProgressBg.ZIndex = 5
+    barProgressBg.Parent = autoGrabProgressFrame
+    Instance.new("UICorner", barProgressBg).CornerRadius = UDim.new(1, 0)
+
+    local barBgStroke = Instance.new("UIStroke")
+    barBgStroke.Color = Color3.fromRGB(60, 60, 90)
+    barBgStroke.Thickness = 1
+    barBgStroke.Transparency = 0.4
+    barBgStroke.Parent = barProgressBg
+
+    barProgressFill = Instance.new("Frame")
+    barProgressFill.Name = "BarFill"
+    barProgressFill.Size = UDim2.new(0, 0, 1, 0)
+    barProgressFill.BackgroundColor3 = Color3.fromRGB(120, 0, 220)
+    barProgressFill.BorderSizePixel = 0
+    barProgressFill.ZIndex = 6
+    barProgressFill.Parent = barProgressBg
+    Instance.new("UICorner", barProgressFill).CornerRadius = UDim.new(1, 0)
+    createRainbowGradient(barProgressFill, 2)
+
+    local fillGlow = Instance.new("ImageLabel")
+    fillGlow.Size = UDim2.new(1, 0, 1, 0)
+    fillGlow.BackgroundTransparency = 1
+    fillGlow.Image = "rbxassetid://5028857084"
+    fillGlow.ImageColor3 = Color3.fromRGB(180, 80, 255)
+    fillGlow.ImageTransparency = 0.6
+    fillGlow.ZIndex = 7
+    fillGlow.Parent = barProgressFill
+
+    -- Percent label centered on the bar
+    progressText = Instance.new("TextLabel")
+    progressText.Name = "ProgressText"
+    progressText.Size = UDim2.new(1, 0, 1, 0)
+    progressText.BackgroundTransparency = 1
+    progressText.Text = "0%"
+    progressText.TextColor3 = Color3.fromRGB(255, 255, 255)
+    progressText.Font = Enum.Font.GothamBold
+    progressText.TextSize = isMobile and 9 or 11
+    progressText.TextStrokeTransparency = 0.4
+    progressText.ZIndex = 8
+    progressText.Parent = barProgressBg
+
+    -- ========================
+    -- RADIUS INPUT (TextBox)
+    -- ========================
+    local inputX = statusBarX + statusBarW + pad
+    local inputW = isMobile and 44 or 52
+
+    -- "R:" label
+    local radiusLabel = Instance.new("TextLabel")
+    radiusLabel.Name = "RadiusLabel"
+    radiusLabel.Size = UDim2.new(0, isMobile and 18 or 22, 0, innerH)
+    radiusLabel.Position = UDim2.new(0, inputX, 0.5, 0)
+    radiusLabel.AnchorPoint = Vector2.new(0, 0.5)
+    radiusLabel.BackgroundTransparency = 1
+    radiusLabel.Text = "R:"
+    radiusLabel.TextColor3 = Theme.TextSecondary
+    radiusLabel.Font = Enum.Font.GothamBold
+    radiusLabel.TextSize = isMobile and 9 or 11
+    radiusLabel.ZIndex = 5
+    radiusLabel.Parent = autoGrabProgressFrame
+
+    local radiusBox = Instance.new("TextBox")
+    radiusBox.Name = "RadiusBox"
+    radiusBox.Size = UDim2.new(0, inputW, 0, switchH)
+    radiusBox.Position = UDim2.new(0, inputX + (isMobile and 20 or 24), 0.5, 0)
+    radiusBox.AnchorPoint = Vector2.new(0, 0.5)
+    radiusBox.BackgroundColor3 = Theme.Background3
+    radiusBox.BorderSizePixel = 0
+    radiusBox.Text = tostring(GRAB_RADIUS)
+    radiusBox.TextColor3 = Color3.fromRGB(255, 255, 255)
+    radiusBox.Font = Enum.Font.GothamBold
+    radiusBox.TextSize = isMobile and 10 or 12
+    radiusBox.TextXAlignment = Enum.TextXAlignment.Center
+    radiusBox.PlaceholderText = "20"
+    radiusBox.ClearTextOnFocus = false
+    radiusBox.ZIndex = 5
+    radiusBox.Parent = autoGrabProgressFrame
+    Instance.new("UICorner", radiusBox).CornerRadius = UDim.new(0, 6)
+    createRainbowGradient(Instance.new("UIStroke", radiusBox), 1.5)
+
+    radiusBox.FocusLost:Connect(function()
+        local newRadius = tonumber(radiusBox.Text)
+        if newRadius and newRadius >= 5 then
+            GRAB_RADIUS = math.floor(newRadius)
+            config.grabRadius = GRAB_RADIUS
+            saveConfig(config)
+            radiusBox.Text = tostring(GRAB_RADIUS)
+            updateRadiusCircle()
+        else
+            radiusBox.Text = tostring(GRAB_RADIUS)
+        end
+    end)
+
+    -- Restore toggle state
+    if config.autoGrabEnabled then
+        autoGrabEnabled = true
+        updatePowerButton(true)
+        task.spawn(function()
+            task.wait(1.5)
+            toggleAutoGrab(true)
+        end)
+    end
+end
+
+-- ========================
+-- PROGRESS FUNCTIONS
+-- ========================
+local function updateAutoGrabProgress(progress)
+    if not barProgressFill or not progressText then return end
+    progress = math.clamp(progress, 0, 100)
+
+    TweenService:Create(barProgressFill, TweenInfo.new(0.05, Enum.EasingStyle.Linear), {
+        Size = UDim2.new(progress / 100, 0, 1, 0)
+    }):Play()
+
+    progressText.Text = math.floor(progress) .. "%"
+
+    if progress >= 100 then
+        local scaleTween = TweenService:Create(barProgressFill,
+            TweenInfo.new(0.15, Enum.EasingStyle.Elastic, Enum.EasingDirection.Out),
+            {Size = UDim2.new(1, 0, 1, 0)}
+        )
+        scaleTween:Play()
+        scaleTween.Completed:Wait()
+        TweenService:Create(barProgressFill,
+            TweenInfo.new(0.15, Enum.EasingStyle.Quad, Enum.EasingDirection.Out),
+            {Size = UDim2.new(1, 0, 1, 0)}
+        ):Play()
+    end
+end
+
+local function hideAutoGrabProgress()
+    updateAutoGrabProgress(0)
+    isActivelyGrabbing = false
+    grabStartTime = nil
+    currentGrabTarget = nil
+end
+
+-- ========================
+-- GAME LOGIC FUNCTIONS
+-- ========================
+local function isMyBase(plotName)
+    local plot = workspace:FindFirstChild("Plots") and workspace.Plots:FindFirstChild(plotName)
+    if not plot then return false end
+    local sign = plot:FindFirstChild("PlotSign")
+    if sign then
+        local yourBase = sign:FindFirstChild("YourBase")
+        if yourBase and yourBase:IsA("BillboardGui") then
+            return yourBase.Enabled == true
+        end
+    end
+    return false
+end
+
+local function isGrabPrompt(prompt)
+    if not prompt or not prompt:IsA("ProximityPrompt") then return false end
+    local objText = prompt.ObjectText and prompt.ObjectText:lower() or ""
+    local actText = prompt.ActionText and prompt.ActionText:lower() or ""
+    return objText:find("steal") or actText:find("steal")
+end
+
+local function findPromptForAnimal(animalData)
+    if not animalData then return nil end
+
+    local uid = animalData.uid
+    if uid and cachedPrompts[uid] and cachedPrompts[uid].Parent then
+        if isGrabPrompt(cachedPrompts[uid]) then
+            return cachedPrompts[uid]
+        else
+            cachedPrompts[uid] = nil
+        end
+    end
+
+    local plots = workspace:FindFirstChild("Plots")
+    if not plots then return nil end
+
+    local plot = plots:FindFirstChild(animalData.plot)
+    if not plot then return nil end
+
+    local podiums = plot:FindFirstChild("AnimalPodiums")
+    if not podiums then return nil end
+
+    local podium = podiums:FindFirstChild(animalData.slot)
+    if not podium then return nil end
+
+    local base = podium:FindFirstChild("Base")
+    if not base then return nil end
+
+    local spawn = base:FindFirstChild("Spawn")
+    if not spawn then return nil end
+
+    local attach = spawn:FindFirstChild("PromptAttachment")
+    if attach then
+        for _, p in ipairs(attach:GetChildren()) do
+            if p:IsA("ProximityPrompt") and isGrabPrompt(p) then
+                if uid then cachedPrompts[uid] = p end
+                return p
+            end
+        end
+    end
+
+    for _, c in ipairs(spawn:GetChildren()) do
+        if c:IsA("ProximityPrompt") and isGrabPrompt(c) then
+            if uid then cachedPrompts[uid] = c end
+            return c
+        end
+    end
+
+    return nil
+end
+
+local function buildGrabCallbacks(prompt)
+    if not prompt then return nil end
+    if internalGrabCache[prompt] then return internalGrabCache[prompt] end
+
+    local data = {holdCallbacks = {}, triggerCallbacks = {}, ready = true}
+
+    local ok, conns = pcall(getconnections, prompt.PromptButtonHoldBegan)
+    if ok and conns then
+        for _, conn in ipairs(conns) do
+            if type(conn.Function) == "function" then
+                table.insert(data.holdCallbacks, conn.Function)
+            end
+        end
+    end
+
+    local ok2, conns2 = pcall(getconnections, prompt.Triggered)
+    if ok2 and conns2 then
+        for _, conn in ipairs(conns2) do
+            if type(conn.Function) == "function" then
+                table.insert(data.triggerCallbacks, conn.Function)
+            end
+        end
+    end
+
+    if #data.holdCallbacks > 0 or #data.triggerCallbacks > 0 then
+        internalGrabCache[prompt] = data
+        return data
+    end
+
+    return nil
+end
+
+local function runCallbackList(list)
+    for _, fn in ipairs(list) do
+        task.spawn(fn)
+    end
+end
+
+local function executeGrab(prompt, animalData)
+    if not prompt then return false end
+
+    local data = buildGrabCallbacks(prompt)
+    if not data or not data.ready then return false end
+
+    data.ready = false
+    isActivelyGrabbing = true
+    grabStartTime = tick()
+    currentGrabTarget = animalData
+
+    updateAutoGrabProgress(0)
+
+    task.spawn(function()
+        runCallbackList(data.holdCallbacks)
+
+        local elapsed = 0
+        while elapsed < GRAB_DURATION and isActivelyGrabbing do
+            task.wait(0.03)
+            elapsed = tick() - grabStartTime
+            local progress = math.min((elapsed / GRAB_DURATION) * 100, 100)
+            updateAutoGrabProgress(progress)
+        end
+
+        runCallbackList(data.triggerCallbacks)
+
+        updateAutoGrabProgress(100)
+        task.wait(0.2)
+
+        isActivelyGrabbing = false
+        grabStartTime = nil
+        currentGrabTarget = nil
+        data.ready = true
+
+        task.wait(0.15)
+        if not isActivelyGrabbing then
+            hideAutoGrabProgress()
+        end
+    end)
+
+    return true
+end
+
+local function scanSinglePlot(plot)
+    if not plot or not plot:IsA("Model") then return end
+    if isMyBase(plot.Name) then return end
+
+    local podiums = plot:FindFirstChild("AnimalPodiums")
+    if not podiums then return end
+
+    for _, podium in ipairs(podiums:GetChildren()) do
+        if not podium:IsA("Model") then continue end
+
+        local hasAnimal = false
+        local animalName = nil
+
+        local base = podium:FindFirstChild("Base")
+        if base then
+            local spawn = base:FindFirstChild("Spawn")
+            if spawn then
+                for _, child in ipairs(spawn:GetChildren()) do
+                    if child:IsA("Model") and child.Name ~= "PromptAttachment" then
+                        hasAnimal = true
+                        animalName = child.Name
+                        break
+                    end
+                end
+            end
+        end
+
+        if not hasAnimal then
+            for _, part in ipairs(podium:GetDescendants()) do
+                if part:IsA("Model") and part.Name ~= "Base" and part.Name ~= "Spawn" then
+                    hasAnimal = true
+                    animalName = part.Name
+                    break
+                end
+            end
+        end
+
+        if hasAnimal then
+            table.insert(allAnimalsCache, {
+                name = animalName or podium.Name,
+                plot = plot.Name,
+                slot = podium.Name,
+                worldPosition = podium:GetPivot().Position,
+                uid = plot.Name .. "_" .. podium.Name,
+            })
+        end
+    end
+end
+
+local function initializeScanner()
+    local plots = workspace:FindFirstChild("Plots")
+    if not plots then
+        plots = workspace:WaitForChild("Plots", 10)
+    end
+    if not plots then return end
+
+    allAnimalsCache = {}
+    for _, plot in ipairs(plots:GetChildren()) do
+        scanSinglePlot(plot)
+    end
+
+    plots.ChildAdded:Connect(function(plot)
+        if plot:IsA("Model") then
+            task.wait(0.5)
+            scanSinglePlot(plot)
+        end
+    end)
+
+    task.spawn(function()
+        while task.wait(5) do
+            if not autoGrabEnabled then continue end
+            allAnimalsCache = {}
+            for _, plot in ipairs(plots:GetChildren()) do
+                scanSinglePlot(plot)
+            end
+        end
+    end)
+end
+
+local function shouldGrab(animalData)
+    if not animalData or not animalData.worldPosition then return false end
+
+    local hrp = getHRP()
+    if not hrp then return false end
+
+    local currentDistance = (hrp.Position - animalData.worldPosition).Magnitude
+    return currentDistance <= GRAB_RADIUS
+end
+
+local function getNearestAnimal()
+    local hrp = getHRP()
+    if not hrp then return nil end
+
+    local nearest = nil
+    local minDist = math.huge
+
+    for _, animalData in ipairs(allAnimalsCache) do
+        if isMyBase(animalData.plot) then continue end
+
+        if animalData.worldPosition then
+            local dist = (hrp.Position - animalData.worldPosition).Magnitude
+            if dist < minDist then
+                minDist = dist
+                nearest = animalData
+            end
+        end
+    end
+
+    return nearest
+end
+
+-- ========================
+-- MAIN AUTO GRAB LOOP
+-- ========================
+local function autoGrabLoop()
+    if grabConnection then grabConnection:Disconnect() grabConnection = nil end
+    if not autoGrabEnabled then return end
+
+    grabConnection = RunService.Heartbeat:Connect(function()
+        if not autoGrabEnabled then return end
+        if not shouldUpdate("autoGrab", 0.03) then return end
+        if isActivelyGrabbing then return end
+
+        local now = tick()
+        if now - lastGrabAttempt < GRAB_COOLDOWN then return end
+
+        local target = getNearestAnimal()
+        if not target then
+            updateAutoGrabProgress(0)
+            return
+        end
+
+        if not shouldGrab(target) then
+            updateAutoGrabProgress(0)
+            return
+        end
+
+        local prompt = findPromptForAnimal(target)
+        if prompt and prompt.Enabled then
+            lastGrabAttempt = now
+            executeGrab(prompt, target)
+        else
+            updateAutoGrabProgress(0)
+        end
+    end)
+end
+
+-- ========================
+-- TOGGLE FUNCTION
+-- ========================
+function toggleAutoGrab(state)
+    autoGrabEnabled = state
+    config.autoGrabEnabled = state
+    saveConfig(config)
+
+    if state then
+        if not game:IsLoaded() then game.Loaded:Wait() end
+        if not LocalPlayer.Character then LocalPlayer.CharacterAdded:Wait() end
+
+        cachedPrompts = {}
+        internalGrabCache = {}
+        lastGrabAttempt = 0
+
+        updateAutoGrabProgress(0)
+        updateRadiusCircle()
+
+        task.spawn(autoGrabLoop)
+    else
+        hideAutoGrabProgress()
+        destroyCircleParts()
+
+        animalScannerRunning = false
+        isActivelyGrabbing = false
+        grabStartTime = nil
+        currentGrabTarget = nil
+
+        if grabConnection then
+            grabConnection:Disconnect()
+            grabConnection = nil
+        end
+
+        cachedPrompts = {}
+    end
+end
+
+-- ========================
+-- CHARACTER HANDLING
+-- ========================
+LocalPlayer.CharacterAdded:Connect(function()
+    task.wait(1)
+
+    isActivelyGrabbing = false
+    grabStartTime = nil
+    currentGrabTarget = nil
+
+    if autoGrabEnabled then
+        toggleAutoGrab(false)
+        task.wait(0.2)
+        toggleAutoGrab(true)
+    end
+end)
+
+screenGui.Destroying:Connect(function()
+    destroyCircleParts()
+    animalScannerRunning = false
+    isActivelyGrabbing = false
+    if grabConnection then grabConnection:Disconnect() end
+    if autoGrabProgressFrame then autoGrabProgressFrame:Destroy() end
+end)
+
+-- ========================
+-- INITIALIZATION
+-- ========================
+createAutoGrabUI()
+
+task.spawn(function()
+    task.wait(2)
+    initializeScanner()
+end)
+
+-- ========================
+-- EXPORT FUNCTIONS
+-- ========================
+return {
+    toggle = toggleAutoGrab,
+    getStatus = function() return autoGrabEnabled end,
+    setRadius = function(newRadius)
+        if newRadius and newRadius >= 5 then
+            GRAB_RADIUS = newRadius
+            config.grabRadius = newRadius
+            saveConfig(config)
+            updateRadiusCircle()
+            return true
+        end
+        return false
+    end,
+    cleanup = function()
+        destroyCircleParts()
+        animalScannerRunning = false
+        isActivelyGrabbing = false
+        if grabConnection then grabConnection:Disconnect() end
+        if screenGui then screenGui:Destroy() end
+    end
+}
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
